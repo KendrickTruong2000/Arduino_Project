@@ -1,40 +1,97 @@
 #include <Arduino.h>
 #include <Arduino_FreeRTOS.h>
+#include <semphr.h>
 
-void taskBlink(void *pvParameter)
-{
-  pinMode(8, OUTPUT);
+/*NOTE for RTOS
+1. Always Give after Take - a mutext never released is a deadlock waiting to happen
+2. Never call xSemaphoreTake from an ISR - use xSemaphoreGiveFromISR instead
+3. keep the critical short - hodling a mutex blcoks every other task that needs it
+*/
 
-  while (1)
-  {
-    digitalWrite(8, HIGH);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    digitalWrite(8, LOW);
-    vTaskDelay(pdMS_TO_TICKS(500));
-  }
-}
+SemaphoreHandle_t serialMutex;
 
-void taskSerial(void *pvParameter)
-{
-  while (1)
-  {
-    Serial.println("taskSerial: alive");
-    vTaskDelay(pdMS_TO_TICKS(1000));
-  }
-}
+void TaskA(void *pvParameter);
+void TaskB(void *pvParameter);
 
 void setup()
 {
   Serial.begin(9600);
+  serialMutex = xSemaphoreCreateMutex();
 
-  xTaskCreate(taskBlink, "Blink", 128, NULL, 1, NULL);
-  xTaskCreate(taskSerial, "Serial", 128, NULL, 1, NULL);
+  xTaskCreate(TaskA, "A", 128, NULL, 1, NULL);
+  xTaskCreate(TaskB, "B", 128, NULL, 1, NULL);
   vTaskStartScheduler();
 }
 
 void loop()
 {
 }
+
+void TaskA(void *pvParameter)
+{
+  while (1)
+  {
+    // acquire the mutex - blocks here if TaskB hold it
+    if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+      Serial.print("[A] temperature: ");
+      vTaskDelay(pdMS_TO_TICKS(2));
+      Serial.println("25 C");
+      xSemaphoreGive(serialMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(300));
+  }
+}
+
+void TaskB(void *pvParameter)
+{
+  while (1)
+  {
+    // acquire the mutex - blocks here if TaskA holds it
+    if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+      Serial.print("[B] speed: ");
+      vTaskDelay(pdMS_TO_TICKS(2));
+      Serial.println("120 km/h");
+      xSemaphoreGive(serialMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(300));
+  }
+}
+// void taskBlink(void *pvParameter)
+// {
+//   pinMode(8, OUTPUT);
+
+//   while (1)
+//   {
+//     digitalWrite(8, HIGH);
+//     vTaskDelay(pdMS_TO_TICKS(200));
+//     digitalWrite(8, LOW);
+//     vTaskDelay(pdMS_TO_TICKS(200));
+//   }
+// }
+
+// void taskSerial(void *pvParameter)
+// {
+//   while (1)
+//   {
+//     Serial.println("taskSerial: alive");
+//     vTaskDelay(pdMS_TO_TICKS(1000));
+//   }
+// }
+
+// void setup()
+// {
+//   Serial.begin(9600);
+
+//   xTaskCreate(taskBlink, "Blink", 128, NULL, 2, NULL);
+//   xTaskCreate(taskSerial, "Serial", 128, NULL, 1, NULL);
+//   vTaskStartScheduler();
+// }
+
+// void loop()
+// {
+// }
 
 // #include <Arduino.h>
 // #include <Arduino_FreeRTOS.h>
