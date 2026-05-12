@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "RTOS_Arduino",
+			"path": "../../Arduino_Project/RTOS_Arduino"
+		},
+		{
+			"name": "Real_Time_Sensor_Inter",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}
