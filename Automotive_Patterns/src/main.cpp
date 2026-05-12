@@ -1,67 +1,33 @@
 #include <Arduino.h>
 #include <Arduino_FreeRTOS.h>
-#include <semphr.h>
 
-#define POT_PIN A0
-#define BUTTON_SW 3
-#define LED_PIN 13
+static volatile uint16_t hbTask10ms = 0;
+static volatile uint8_t hbTask100ms = 0;
+static volatile bool systemFault = false;
 
-SemaphoreHandle_t serialMutex;
+// hang triggered by watchdog after it confirms normal operation
+static volatile bool triggerHang = false;
 
-// ── Simulated ECU signals ─────────────────────────────────────
-// In a real ECU these would be shared via a global signal database
-// (AUTOSAR calls this the RTE — Runtime Environment)
-static volatile int gThrottle = 0;    // 0-100%
-static volatile int gEngineTemp = 20; // degrees C
-static volatile long gOdometer = 0;   // cumulative counts
-static volatile bool gButtonState = false;
-
-volatile unsigned long lastPressTime = 0;
-
-void isrButton()
-{
-  unsigned long now = millis();
-  if (now - lastPressTime < 200)
-    return;
-  lastPressTime = now;
-  gButtonState = true; // flag for 100ms task to pick up
-}
-
-// ─────────────────────────────────────────────────────────────
-// 10ms task — fast control loop
-// Reads throttle position sensor every 10ms
-// Simulates: engine management, ABS wheel speed processing
-// Highest priority — must never miss deadline
-// ─────────────────────────────────────────────────────────────
 void task10ms(void *pvParameters)
 {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xPeriod = pdMS_TO_TICKS(10);
-  static int missedDeadlines = 0;
 
   for (;;)
   {
-    // read throttle — fast analog read
-    int raw = analogRead(POT_PIN);
-    gThrottle = map(raw, 0, 1023, 0, 100);
-    gOdometer += gThrottle; // accumulate as proxy for distance
+    hbTask10ms++;
 
-    // check if we missed our deadline
-    // xLastWakeTime would have been updated even if late
-    // so we detect by checking tick count drift
-    if (xTaskGetTickCount() > xLastWakeTime + xPeriod)
+    // only hang when watchdog explicitly sets the flag
+    if (triggerHang)
     {
-      missedDeadlines++;
+      Serial.println(F("[10ms] HANG"));
+      vTaskDelay(portMAX_DELAY);
     }
 
     vTaskDelayUntil(&xLastWakeTime, xPeriod);
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// 100ms task — medium rate monitoring
-// Simulates: temperature monitoring, voltage check, event detection
-// ─────────────────────────────────────────────────────────────
 void task100ms(void *pvParameters)
 {
   TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -69,58 +35,80 @@ void task100ms(void *pvParameters)
 
   for (;;)
   {
-    // simulate engine temp slowly rising with throttle
-    // in real ECU this would read an ADC connected to NTC thermistor
-    gEngineTemp += (gThrottle > 50) ? 1 : -1;
-    gEngineTemp = constrain(gEngineTemp, 20, 120);
+    hbTask100ms++;
 
-    // pick up button event
-    if (gButtonState)
+    if (!systemFault)
     {
-      gButtonState = false;
-      xSemaphoreTake(serialMutex, portMAX_DELAY);
-      Serial.print(F("[100ms] BRAKE at t="));
-      Serial.print(millis());
-      Serial.println(F("ms"));
-      xSemaphoreGive(serialMutex);
+      Serial.print(F("[100ms] hb10="));
+      Serial.print(hbTask10ms);
+      Serial.print(F(" hb100="));
+      Serial.println(hbTask100ms);
     }
-
-    // blink LED at 100ms rate when throttle > 50%
-    digitalWrite(LED_PIN, gThrottle > 50 ? HIGH : LOW);
 
     vTaskDelayUntil(&xLastWakeTime, xPeriod);
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// 1000ms task — slow housekeeping
-// Simulates: dashboard refresh, DTC logging, comms heartbeat
-// Lowest priority — best effort, can be delayed by higher tasks
-// ─────────────────────────────────────────────────────────────
-void task1000ms(void *pvParameters)
+void taskWatchdog(void *pvParameters)
 {
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  const TickType_t xPeriod = pdMS_TO_TICKS(1000);
+  // grace period
+  vTaskDelay(pdMS_TO_TICKS(2000));
+
+  uint16_t lastHb10ms = hbTask10ms;
+  uint8_t lastHb100ms = hbTask100ms;
+
+  Serial.print(F("[WDG] started hb10="));
+  Serial.print(lastHb10ms);
+  Serial.print(F(" hb100="));
+  Serial.println(lastHb100ms);
+
+  // let watchdog confirm 3 healthy cycles before triggering hang
+  uint8_t healthyCycles = 0;
 
   for (;;)
   {
-    xSemaphoreTake(serialMutex, portMAX_DELAY);
-    Serial.println(F("──────────────────────"));
-    Serial.print(F("[1000ms] t="));
-    Serial.print(millis());
-    Serial.println(F("ms"));
-    Serial.print(F("[1000ms] throttle="));
-    Serial.print(gThrottle);
-    Serial.println(F("%"));
-    Serial.print(F("[1000ms] engineTemp="));
-    Serial.print(gEngineTemp);
-    Serial.println(F("C"));
-    Serial.print(F("[1000ms] odometer="));
-    Serial.println(gOdometer);
-    Serial.println(F("──────────────────────"));
-    xSemaphoreGive(serialMutex);
+    vTaskDelay(pdMS_TO_TICKS(500));
 
-    vTaskDelayUntil(&xLastWakeTime, xPeriod);
+    bool fault = false;
+
+    if (hbTask10ms == lastHb10ms)
+    {
+      Serial.print(F("[WDG] FAULT task10ms t="));
+      Serial.print(millis());
+      Serial.println(F("ms"));
+      fault = true;
+    }
+
+    if (hbTask100ms == lastHb100ms)
+    {
+      Serial.print(F("[WDG] FAULT task100ms t="));
+      Serial.print(millis());
+      Serial.println(F("ms"));
+      fault = true;
+    }
+
+    lastHb10ms = hbTask10ms;
+    lastHb100ms = hbTask100ms;
+
+    if (fault)
+    {
+      systemFault = true;
+      Serial.println(F("[WDG] ECU fault — reset triggered"));
+      vTaskDelay(portMAX_DELAY);
+    }
+    else
+    {
+      healthyCycles++;
+      Serial.print(F("[WDG] healthy cycle "));
+      Serial.println(healthyCycles);
+
+      // after 3 healthy cycles trigger the hang to demonstrate fault
+      if (healthyCycles == 3)
+      {
+        Serial.println(F("[WDG] triggering hang for demo..."));
+        triggerHang = true;
+      }
+    }
   }
 }
 
@@ -129,19 +117,9 @@ void setup()
   Serial.begin(9600);
   Serial.println(F("Boot"));
 
-  pinMode(POT_PIN, INPUT);
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(BUTTON_SW, INPUT_PULLUP);
-
-  attachInterrupt(digitalPinToInterrupt(BUTTON_SW), isrButton, FALLING);
-
-  serialMutex = xSemaphoreCreateMutex();
-
-  // priority mirrors rate — faster task = higher priority
-  // this ensures high-frequency tasks always preempt low-frequency ones
-  xTaskCreate(task10ms, "10ms", 120, NULL, 3, NULL);
-  xTaskCreate(task100ms, "100ms", 120, NULL, 2, NULL);
-  xTaskCreate(task1000ms, "1000ms", 160, NULL, 1, NULL);
+  xTaskCreate(task10ms, "10ms", 80, NULL, 2, NULL);
+  xTaskCreate(task100ms, "100ms", 100, NULL, 2, NULL);
+  xTaskCreate(taskWatchdog, "WDG", 100, NULL, 2, NULL);
 
   Serial.println(F("Go"));
   vTaskStartScheduler();
